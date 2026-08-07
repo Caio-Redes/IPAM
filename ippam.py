@@ -4,25 +4,116 @@ import io
 import ipaddress
 import json
 import os
+import socket
 import sqlite3
+import subprocess
 import urllib.request
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ==========================================
-# CONFIGURAÇÃO INICIAL
+# 1. CONFIGURAÇÃO INICIAL E ESTILIZAÇÃO CSS
 # ==========================================
 st.set_page_config(
-    page_title="IPAM Enterprise - Gestão de IPs, ASNs e Engenharia",
+    page_title="IPAM Enterprise - Gestão, Automação e Engenharia NOC",
     layout="wide",
     page_icon="🌐",
 )
 
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #0d1117;
+        color: #c9d1d9;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 15px 20px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-3px);
+        border-color: #58a6ff;
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #8b949e !important;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #58a6ff !important;
+        font-weight: bold;
+    }
+    .stButton>button {
+        border-radius: 6px;
+        font-weight: 600;
+        transition: all 0.2s ease;
+    }
+    .stCodeBlock {
+        border-left: 4px solid #238636 !important;
+        border-radius: 4px;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        background-color: #161b22;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+components.html("""
+<script>
+const doc = window.parent.document;
+doc.addEventListener('keydown', function(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        const input = doc.querySelector('input[aria-label*="Digite um IP"]');
+        if (input) input.focus();
+    }
+});
+</script>
+""", height=0)
+
+
+def botao_copiar(texto_para_copiar, id_unico="btnCopy"):
+  js_code = f"""
+    <script>
+    function copyText_{id_unico}() {{
+        navigator.clipboard.writeText({json.dumps(texto_para_copiar)});
+        let btn = document.getElementById('{id_unico}');
+        btn.innerText = "✅ Copiado!";
+        btn.style.backgroundColor = "#2ea043";
+        setTimeout(() => {{ 
+            btn.innerText = "📋 Copiar Configuração"; 
+            btn.style.backgroundColor = "#238636";
+        }}, 2000);
+    }}
+    </script>
+    <button id="{id_unico}" onclick="copyText_{id_unico}()" style="
+        background-color: #238636;
+        color: #ffffff;
+        border: 1px solid rgba(240,246,252,0.1);
+        padding: 8px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        margin-top: 5px;
+        margin-bottom: 10px;">
+        📋 Copiar Configuração
+    </button>
+    """
+  components.html(js_code, height=50)
+
+
 DB_FILE = "ipam_database.db"
-EXCEL_FILE = "ipam_database.xlsx"
 
 COLUNAS_ASN = ["ASN", "Entidade", "Tipo", "Contato"]
 COLUNAS_IP = [
@@ -38,25 +129,22 @@ COLUNAS_IP = [
 
 
 # ==========================================
-# FUNÇÕES DE SEGURANÇA E HASH DE SENHA
+# 2. SEGURANÇA E HASH DE SENHA
 # ==========================================
 def make_hashes(password):
-  """Gera o hash SHA-256 da senha."""
   return hashlib.sha256(str.encode(password)).hexdigest()
 
 
 def check_hashes(password, hashed_text):
-  """Verifica se a senha digitada corresponde ao hash armazenado."""
   if make_hashes(password) == hashed_text:
     return True
   return False
 
 
 # ==========================================
-# GESTÃO DE BANCO DE DADOS (SQLITE)
+# 3. GESTÃO DE BANCO DE DADOS (SQLITE)
 # ==========================================
 def init_db():
-  """Inicializa e atualiza a estrutura do banco de dados SQLite."""
   conn = sqlite3.connect(DB_FILE)
   cursor = conn.cursor()
 
@@ -93,7 +181,13 @@ def init_db():
         )
     """)
 
-  # Migração da coluna de usuário nos logs
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS configuracoes (
+            chave TEXT PRIMARY KEY,
+            valor TEXT
+        )
+    """)
+
   try:
     cursor.execute("ALTER TABLE audit_logs ADD COLUMN usuario TEXT")
   except sqlite3.OperationalError:
@@ -107,7 +201,6 @@ def init_db():
         )
     """)
 
-  # Criar usuário admin padrão se a tabela estiver vazia
   cursor.execute("SELECT COUNT(*) FROM users")
   if cursor.fetchone()[0] == 0:
     cursor.execute(
@@ -120,7 +213,6 @@ def init_db():
 
 
 def registrar_log(acao, tabela, detalhes):
-  """Registra alterações na tabela de audit_logs."""
   conn = sqlite3.connect(DB_FILE)
   cursor = conn.cursor()
   agora = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -132,6 +224,9 @@ def registrar_log(acao, tabela, detalhes):
   )
   conn.commit()
   conn.close()
+  enviar_notificacao_webhook(
+      f"🔔 *IPAM Alert* | {usuario_atual} realizou *{acao}* em *{tabela}*: {detalhes}"
+  )
 
 
 def autenticar_usuario(username, password):
@@ -144,7 +239,7 @@ def autenticar_usuario(username, password):
   conn.close()
 
   if result and check_hashes(password, result[0]):
-    return result[1]  # Retorna a role ('admin' ou 'operator')
+    return result[1]
   return None
 
 
@@ -176,11 +271,44 @@ def carregar_logs():
   return df
 
 
-# Inicializa DB
+def obter_configuracao(chave):
+  conn = sqlite3.connect(DB_FILE)
+  cursor = conn.cursor()
+  cursor.execute("SELECT valor FROM configuracoes WHERE chave=?", (chave,))
+  res = cursor.fetchone()
+  conn.close()
+  return res[0] if res else ""
+
+
+def salvar_configuracao(chave, valor):
+  conn = sqlite3.connect(DB_FILE)
+  cursor = conn.cursor()
+  cursor.execute(
+      "INSERT OR REPLACE INTO configuracoes (chave, valor) VALUES (?, ?)",
+      (chave, valor),
+  )
+  conn.commit()
+  conn.close()
+
+
+def enviar_notificacao_webhook(msg):
+  webhook_url = obter_configuracao("webhook_url")
+  if not webhook_url:
+    return
+  try:
+    payload = json.dumps({"text": msg, "content": msg}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req, timeout=3)
+  except Exception:
+    pass
+
+
 init_db()
 
 # ==========================================
-# GERENCIAMENTO DE SESSÃO / TELA DE LOGIN
+# 4. TELA DE LOGIN / SESSÃO
 # ==========================================
 if "logged_in" not in st.session_state:
   st.session_state["logged_in"] = False
@@ -191,9 +319,7 @@ if "user_role" not in st.session_state:
 
 if not st.session_state["logged_in"]:
   st.title("🔒 Acesso Restrito - IPAM Enterprise")
-  st.markdown(
-      "Entre com suas credenciais de usuário para acessar o painel de redes."
-  )
+  st.markdown("Entre com suas credenciais para acessar o painel NOC.")
 
   with st.form("login_form"):
     user_input = st.text_input("Usuário")
@@ -216,7 +342,7 @@ if not st.session_state["logged_in"]:
 
 
 # ==========================================
-# EXPORTAÇÃO E ESTILIZAÇÃO DO EXCEL
+# 5. FUNÇÕES DE UTILIDADE DE REDE & FERRAMENTAS
 # ==========================================
 def gerar_excel_formatado():
   df_asn = carregar_dados_asn()
@@ -284,9 +410,6 @@ def gerar_excel_formatado():
   return output.getvalue()
 
 
-# ==========================================
-# FUNÇÕES DE INTELIGÊNCIA DE REDE
-# ==========================================
 def verificar_overlap(novo_prefixo):
   try:
     nova_rede = ipaddress.ip_network(novo_prefixo.strip(), strict=False)
@@ -353,12 +476,85 @@ def consultar_rdap_asn(asn_num):
     }
 
 
-# ==========================================
-# INTERFACE STREAMLIT
-# ==========================================
-st.title("🌐 IPAM Enterprise - Gestão Integrada de Redes")
+def consultar_peeringdb(asn_num):
+  clean_asn = asn_num.upper().replace("AS", "").strip()
+  url = f"https://www.peeringdb.com/api/net?asn={clean_asn}"
+  try:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=5) as response:
+      if response.status == 200:
+        data = json.loads(response.read().decode())
+        if data.get("data"):
+          info = data["data"][0]
+          return {
+              "Nome PeeringDB": info.get("name"),
+              "Organização": info.get("org_name"),
+              "Website": info.get("website"),
+              "Política de Peering": info.get("policy_general"),
+              "Capacidade IPv4": info.get("info_never_via_route_servers"),
+              "Local do IXP": info.get("city"),
+          }
+    return {"Mensagem": "ASN não localizado no PeeringDB."}
+  except Exception as e:
+    return {"Erro": str(e)}
 
-# Painel Lateral de Informações do Usuário & Logout
+
+def consultar_rbl(ip_str):
+  rbls = ["zen.spamhaus.org", "bl.spamcop.net", "dnsbl.sorbs.net"]
+  resultados = []
+  try:
+    ip_obj = ipaddress.ip_address(ip_str.strip())
+    if ip_obj.version == 6:
+      return [{"RBL": "N/A", "Status": "RBL não suporta IPv6 diretamente"}]
+    rev_ip = ".".join(reversed(ip_str.split(".")))
+
+    for rbl in rbls:
+      query = f"{rev_ip}.{rbl}"
+      try:
+        socket.gethostbyname(query)
+        resultados.append({"RBL": rbl, "Status": "⚠️ LISTADO (Blacklist)"})
+      except socket.gaierror:
+        resultados.append({"RBL": rbl, "Status": "✅ Limpo (OK)"})
+    return resultados
+  except Exception as e:
+    return [{"RBL": "Erro", "Status": str(e)}]
+
+
+def testar_ping(host):
+  param = "-n 1" if os.name == "nt" else "-c 1"
+  cmd = ["ping", param, "1", host]
+  try:
+    res = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2
+    )
+    return res.returncode == 0
+  except Exception:
+    return False
+
+
+def testar_porta_tcp(host, port):
+  try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    result = sock.connect_ex((host, int(port)))
+    sock.close()
+    return result == 0
+  except Exception:
+    return False
+
+
+def resolver_ptr_dns(ip_str):
+  try:
+    return socket.gethostbyaddr(ip_str)[0]
+  except Exception:
+    return "Sem entrada PTR registrada"
+
+
+# ==========================================
+# 6. INTERFACE PRINCIPAL E NAVIGATION
+# ==========================================
+st.title("🌐 IPAM Enterprise - Gestão, Automação & NOC")
+
 st.sidebar.markdown(
     f"👤 **Usuário**: `{st.session_state['username']}`"
     f" ({st.session_state['user_role']})"
@@ -374,31 +570,29 @@ st.sidebar.divider()
 df_asn = carregar_dados_asn()
 df_ip = carregar_dados_ip()
 
-# Opções de Menu
 opcoes_menu = [
-    "📊 Dashboard & Busca Global",
+    "📊 Dashboard & Capacidade POPs",
     "📋 Cadastrar ASN",
     "📌 Cadastrar Bloco IP",
     "✏️ Editar / Excluir Registros",
     "🧮 Calculadora & Subnetting",
     "⚡ Gerador Prefix-List BGP",
-    "🛠️ Utilidades NOC (CLI & PTR)",
-    "🔎 Consulta WHOIS/RDAP",
+    "🛠️ Utilidades NOC (CLI, PTR & Diagnósticos)",
+    "🔎 Consulta WHOIS/RDAP, PeeringDB & Blacklists",
+    "📂 Importação & Exportação (CSV/Excel)",
     "📜 Histórico & Audit Log",
-    "☁️ Exportação Excel / Nuvem",
 ]
 
-# Exibe o menu de Gestão de Usuários apenas para administradores
 if st.session_state["user_role"] == "admin":
-  opcoes_menu.append("🔐 Gestão de Usuários")
+  opcoes_menu.append("🔐 Gestão do Sistema & Backup")
 
 aba = st.sidebar.radio("Navegação Principal", opcoes_menu)
 
 # ==========================================
-# ABA 1: DASHBOARD & BUSCA GLOBAL
+# ABA 1: DASHBOARD & CAPACIDADE
 # ==========================================
-if aba == "📊 Dashboard & Busca Global":
-  st.header("📊 Visão Geral e Busca Rápida de Hosts")
+if aba == "📊 Dashboard & Capacidade POPs":
+  st.header("📊 Visão Geral, Métricas e Topologia de Rede")
 
   col1, col2, col3, col4 = st.columns(4)
   col1.metric("ASNs Cadastrados", len(df_asn))
@@ -417,18 +611,47 @@ if aba == "📊 Dashboard & Busca Global":
 
   st.divider()
 
-  st.subheader("🎯 Buscar um bloco IP")
+  st.subheader("🎯 Buscar um Bloco ou Host (Atalho: Ctrl + K)")
   ip_query = st.text_input(
-      "Digite um IP para identificar o bloco, Pode ser Network, Gatewy ou Válido (ex:"
-      " 192.168.1.1):"
+      "Digite um IP para identificar a qual bloco pertence (ex: 192.168.1.1):",
+      key="ip_search",
   )
   if ip_query:
     res = buscar_ip_global(ip_query)
     if not res.empty:
-      st.success(f"O IP `{ip_query}` pertence ao bloco cadastrado:")
+      st.success(f"O IP `{ip_query}` pertence ao bloco cadastrado abaixo:")
       st.dataframe(res, use_container_width=True)
     else:
       st.warning(f"O IP `{ip_query}` não pertence a nenhum bloco cadastrado.")
+
+  st.divider()
+
+  # Ocupação por POP / Localidade
+  if not df_ip.empty:
+    st.subheader("📍 Alocação de Blocos por POP / Localidade")
+    pop_counts = df_ip["POP / Localidade"].value_counts().reset_index()
+    pop_counts.columns = ["POP / Localidade", "Total de Blocos Alocados"]
+    st.dataframe(pop_counts, use_container_width=True)
+
+  # Mapa Visual de Topologia BGP
+  if not df_asn.empty:
+    st.subheader("🗺️ Mapa Visual de Topologia BGP & ASNs")
+    dot_code = 'digraph BGP {\n  bgcolor="#0d1117";\n  node [shape=box, style="filled,rounded", fontname="Segoe UI", color="#30363d", fontcolor="#ffffff"];\n  edge [color="#58a6ff", fontname="Segoe UI", fontcolor="#8b949e"];\n'
+
+    for _, r in df_asn.iterrows():
+      asn_label = f"{r['ASN']}\\n{r['Entidade']}"
+      if r["Tipo"] == "Próprio":
+        dot_code += f'  "{r["ASN"]}" [label="{asn_label}", fillcolor="#1f6beb", color="#58a6ff"];\n'
+      else:
+        dot_code += f'  "{r["ASN"]}" [label="{asn_label}", fillcolor="#21262d"];\n'
+
+      if r["Tipo"] != "Próprio":
+        proprios = df_asn[df_asn["Tipo"] == "Próprio"]["ASN"].tolist()
+        for p in proprios:
+          dot_code += f'  "{r["ASN"]}" -> "{p}" [label="{r["Tipo"]}"];\n'
+
+    dot_code += "}"
+    st.graphviz_chart(dot_code)
 
   st.divider()
 
@@ -454,6 +677,9 @@ elif aba == "📋 Cadastrar ASN":
     if st.form_submit_button("Salvar ASN"):
       if asn_num and entidade:
         clean_asn = asn_num.upper().strip()
+        if not clean_asn.startswith("AS"):
+          clean_asn = f"AS{clean_asn}"
+
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         try:
@@ -481,14 +707,14 @@ elif aba == "📌 Cadastrar Bloco IP":
   with st.form("form_ip", clear_on_submit=True):
     col_a, col_b = st.columns(2)
     with col_a:
-      prefixo = st.text_input("Bloco CIDR (ex: X.X.X.X/30)")
-      asn_vinc = st.text_input("ASN Vinculado (ex: xxxxx)")
-      finalidade = st.text_input("Finalidade (ex: INFORMAÇÃO / DESCRIÇÃO)")
+      prefixo = st.text_input("Bloco CIDR (ex: 192.168.1.0/24)")
+      asn_vinc = st.text_input("ASN Vinculado (ex: AS264698)")
+      finalidade = st.text_input("Finalidade (ex: SERVIDORES / NOC)")
     with col_b:
       vlan_id = st.text_input("VLAN ID (ex: 100)")
       vrf = st.text_input("VRF (ex: VRF-INTERNET)")
       pop = st.text_input("POP / Localidade (ex: POP-SP-01)")
-      id_circuito = st.text_input("ID Circuito (ex: L2VPN-(NOME DO CLIENTE)-88412)")
+      id_circuito = st.text_input("ID Circuito (ex: L2VPN-CLIENTE-88412)")
 
     if st.form_submit_button("Salvar Bloco IP"):
       try:
@@ -527,10 +753,10 @@ elif aba == "📌 Cadastrar Bloco IP":
           st.success(f"Bloco IP {str_prefixo} cadastrado com sucesso!")
           st.rerun()
       except ValueError:
-        st.error("Formato CIDR inválido. Exemplo correto: 192.168.1.0/30")
+        st.error("Formato CIDR inválido. Exemplo correto: 192.168.1.0/24")
 
 # ==========================================
-# ABA 4: EDITAR / EXCLUIR
+# ABA 4: EDITAR / EXCLUIR REGISTROS
 # ==========================================
 elif aba == "✏️ Editar / Excluir Registros":
   st.header("✏️ Gerenciar Registros Existentes")
@@ -631,9 +857,7 @@ elif aba == "✏️ Editar / Excluir Registros":
 # ==========================================
 elif aba == "🧮 Calculadora & Subnetting":
   st.header("🧮 Calculadora e Expansor de Sub-redes")
-  pref = st.text_input(
-      "Digite o bloco/sub-rede CIDR:", value="X.X.X.X/30"
-  )
+  pref = st.text_input("Digite o bloco/sub-rede CIDR:", value="192.168.0.0/24")
 
   if pref:
     try:
@@ -685,7 +909,7 @@ elif aba == "🧮 Calculadora & Subnetting":
       st.error("Bloco CIDR inválido.")
 
 # ==========================================
-# ABA 6: GERADOR PREFIX-LIST
+# ABA 6: GERADOR PREFIX-LIST BGP
 # ==========================================
 elif aba == "⚡ Gerador Prefix-List BGP":
   st.header("⚡ Gerador de Prefix-Lists BGP")
@@ -722,20 +946,23 @@ elif aba == "⚡ Gerador Prefix-List BGP":
           script_out += f'/routing filter rule add chain={nome_pl} rule="if (dst in {p}) {{ accept }}"\n'
 
       st.code(script_out, language="text")
+      botao_copiar(script_out, id_unico="btnCopyPL")
 
 # ==========================================
-# ABA 7: UTILIDADES NOC (CLI & PTR)
+# ABA 7: UTILIDADES NOC & DIAGNÓSTICOS
 # ==========================================
-elif aba == "🛠️ Utilidades NOC (CLI & PTR)":
-  st.header("🛠️ Automação NOC: Configuração de Interfaces & DNS Reverso")
-  if df_ip.empty:
-    st.info("Cadastre blocos IP para utilizar a ferramenta NOC.")
-  else:
-    tab_cli, tab_ptr = st.tabs(
-        ["Gerador de Configuração CLI", "Gerador de DNS Reverso (PTR)"]
-    )
+elif aba == "🛠️ Utilidades NOC (CLI, PTR & Diagnósticos)":
+  st.header("🛠️ Automação e Ferramentas NOC")
+  tab_cli, tab_ptr, tab_diag = st.tabs([
+      "Gerador CLI Interfaces",
+      "Gerador DNS Reverso (PTR)",
+      "⚡ Diagnósticos Ativos (Ping / Port / DNS)",
+  ])
 
-    with tab_cli:
+  with tab_cli:
+    if df_ip.empty:
+      st.info("Cadastre blocos IP para utilizar o gerador.")
+    else:
       bloco_cli = st.selectbox(
           "Selecione o Bloco IP:", df_ip["Prefixo"].tolist()
       )
@@ -755,7 +982,7 @@ elif aba == "🛠️ Utilidades NOC (CLI & PTR)":
       vlan = row_cli["VLAN ID"] or "100"
       desc = f"{row_cli['Finalidade']} - {row_cli['ID Circuito']}"
 
-      st.subheader("Script de Interface / Sub-interface:")
+      st.subheader("Script de Configuração de Interface:")
       cli_code = ""
 
       if vendor_cli == "Cisco (IOS-XE)":
@@ -764,28 +991,31 @@ elif aba == "🛠️ Utilidades NOC (CLI & PTR)":
  description {desc}
  ip address {ip_gw} {r.netmask}
  no shutdown"""
-
       elif vendor_cli == "Huawei (VRP)":
         cli_code = f"""interface GigabitEthernet0/1/0.{vlan}
  dot1q termination vid {vlan}
  description {desc}
  ip address {ip_gw} {r.prefixlen}
  arp broadcast enable"""
-
       elif vendor_cli == "Juniper (Junos)":
         cli_code = f"""set interfaces ge-0/0/0 unit {vlan} vlan-id {vlan}
 set interfaces ge-0/0/0 unit {vlan} description "{desc}"
 set interfaces ge-0/0/0 unit {vlan} family inet address {ip_gw}/{r.prefixlen}"""
-
       elif vendor_cli == "MikroTik RouterOS v7":
         cli_code = f"""/interface vlan add name=vlan{vlan} vlan-id={vlan} interface=ether1 comment="{desc}"
 /ip address add address={ip_gw}/{r.prefixlen} interface=vlan{vlan}"""
 
       st.code(cli_code, language="text")
+      botao_copiar(cli_code, id_unico="btnCopyCLI")
 
-    with tab_ptr:
+  with tab_ptr:
+    if df_ip.empty:
+      st.info("Cadastre blocos IP para utilizar a ferramenta.")
+    else:
       bloco_ptr = st.selectbox(
-          "Selecione o Bloco para Zona Reverso:", df_ip["Prefixo"].tolist()
+          "Selecione o Bloco para Zona Reverso:",
+          df_ip["Prefixo"].tolist(),
+          key="ptr_box",
       )
       dominio_ptr = st.text_input("Domínio de Host (ex: noc.provedor.com.br)")
 
@@ -801,46 +1031,89 @@ set interfaces ge-0/0/0 unit {vlan} family inet address {ip_gw}/{r.prefixlen}"""
                 f"{octetos[3]}\tIN\tPTR\thost-{octetos[3]}.{dominio_ptr}.\n"
             )
         else:
-          ptr_out = "; Exemplo para bloco IPv6 ou sub-rede reduzida:\n"
-          ptr_out += f"; Prefixo: {r_ptr.network_address} PTR {dominio_ptr}"
+          ptr_out = (
+              f"; Zona IPv6/Sub-rede personalizada:\n; Prefixo:"
+              f" {r_ptr.network_address} PTR {dominio_ptr}"
+          )
 
         st.code(ptr_out, language="text")
+        botao_copiar(ptr_out, id_unico="btnCopyPTR")
+
+  with tab_diag:
+    st.subheader("📡 Diagnósticos Ativos em Tempo Real")
+    col_d1, col_d2, col_d3 = st.columns(3)
+
+    with col_d1:
+      st.markdown("#### Teste de ICMP Ping")
+      host_ping = st.text_input("IP para Ping (ex: 8.8.8.8)")
+      if st.button("Disparar Ping"):
+        if host_ping:
+          res_ping = testar_ping(host_ping)
+          if res_ping:
+            st.success(f" Host `{host_ping}` respondendo!")
+          else:
+            st.error(f"❌ Host `{host_ping}` não respondeu.")
+
+    with col_d2:
+      st.markdown("#### Teste de Porta TCP")
+      host_tcp = st.text_input("IP / Host TCP")
+      porta_tcp = st.number_input("Porta (ex: 22, 80, 443)", value=22, step=1)
+      if st.button("Testar Porta TCP"):
+        if host_tcp:
+          res_tcp = testar_porta_tcp(host_tcp, porta_tcp)
+          if res_tcp:
+            st.success(f" Porta `{porta_tcp}` aberta em `{host_tcp}`!")
+          else:
+            st.error(f"❌ Porta `{porta_tcp}` fechada/timeout em `{host_tcp}`.")
+
+    with col_d3:
+      st.markdown("#### Checagem PTR DNS Reverso")
+      ip_ptr_test = st.text_input("IP para consulta PTR")
+      if st.button("Resolver PTR"):
+        if ip_ptr_test:
+          res_ptr = resolver_ptr_dns(ip_ptr_test)
+          st.info(f" Hostname PTR: `{res_ptr}`")
 
 # ==========================================
-# ABA 8: CONSULTA WHOIS/RDAP
+# ABA 8: CONSULTAS BGP, RDAP & BLACKLISTS
 # ==========================================
-elif aba == "🔎 Consulta WHOIS/RDAP":
-  st.header("🔎 Consulta RDAP/WHOIS de ASN")
-  asn_query = st.text_input(
-      "Digite o número do ASN para consulta (ex: 264698)"
+elif aba == "🔎 Consulta WHOIS/RDAP, PeeringDB & Blacklists":
+  st.header("🔎 Inteligência BGP, RDAP e Checagem de Blacklists")
+
+  t_rdap, t_pdb, t_rbl = st.tabs(
+      ["Consulta RDAP/Registro.br", "PeeringDB Lookups", "Checagem de RBL"]
   )
 
-  if st.button("Consultar no Registro.br / RDAP"):
-    if asn_query:
-      dados_rdap = consultar_rdap_asn(asn_query)
-      st.json(dados_rdap)
+  with t_rdap:
+    asn_query = st.text_input(
+        "Digite o número do ASN para consulta (ex: 264698)"
+    )
+    if st.button("Consultar no Registro.br / RDAP"):
+      if asn_query:
+        dados_rdap = consultar_rdap_asn(asn_query)
+        st.json(dados_rdap)
+
+  with t_pdb:
+    asn_pdb = st.text_input("Digite o ASN para consultar no PeeringDB:")
+    if st.button("Buscar PeeringDB"):
+      if asn_pdb:
+        dados_pdb = consultar_peeringdb(asn_pdb)
+        st.json(dados_pdb)
+
+  with t_rbl:
+    ip_rbl = st.text_input("Digite o IPv4 para verificar em Blacklists (RBL):")
+    if st.button("Verificar Blacklists"):
+      if ip_rbl:
+        res_rbl = consultar_rbl(ip_rbl)
+        st.dataframe(pd.DataFrame(res_rbl), use_container_width=True)
 
 # ==========================================
-# ABA 9: HISTÓRICO & AUDIT LOG
+# ABA 9: IMPORTAÇÃO & EXPORTAÇÃO
 # ==========================================
-elif aba == "📜 Histórico & Audit Log":
-  st.header("📜 Histórico de Alterações (Audit Log)")
-  df_logs = carregar_logs()
-  if df_logs.empty:
-    st.info("Nenhum registro de log até o momento.")
-  else:
-    st.dataframe(df_logs, use_container_width=True)
+elif aba == "📂 Importação & Exportação (CSV/Excel)":
+  st.header("📂 Gerenciamento de Dados em Massa")
 
-# ==========================================
-# ABA 10: EXPORTAÇÃO EXCEL / NUVEM
-# ==========================================
-elif aba == "☁️ Exportação Excel / Nuvem":
-  st.header("☁️ Exportar Planilha Formatada (.xlsx)")
-  st.write("""
-    Baixe a planilha multi-aba totalmente estilizada em Excel (`.xlsx`). 
-    Ao abri-la no **Excel** ou no **Google Sheets**, as abas **ASNs** e **Blocos_IP** estarão perfeitamente separadas com cabeçalho azul e larguras ajustadas.
-    """)
-
+  st.subheader("📥 Exportação de Planilha Excel Estilizada")
   excel_data = gerar_excel_formatado()
   st.download_button(
       label="📥 Baixar IPAM_Database.xlsx",
@@ -851,158 +1124,204 @@ elif aba == "☁️ Exportação Excel / Nuvem":
       ),
   )
 
-# ==========================================
-# ABA 11: GESTÃO DE USUÁRIOS (APENAS ADMIN)
-# ==========================================
-elif aba == "🔐 Gestão de Usuários":
-  # Validação de segurança estrita para Admin
-  if st.session_state["user_role"] != "admin":
-    st.error(
-        "⚠️ Acesso Negado! Apenas administradores têm permissão para acessar a"
-        " gestão de usuários."
-    )
-    st.stop()
+  st.divider()
 
-  st.header("🔐 Controle de Usuários e Permissões de Acesso")
+  st.subheader("📤 Importar Blocos IP via arquivo CSV")
+  st.markdown(
+      "O arquivo CSV deve conter o cabeçalho exatamente assim: `Prefixo, Versão,"
+      " ASN Vinculado, Finalidade, VLAN ID, VRF, POP / Localidade, ID Circuito`"
+  )
+  uploaded_file = st.file_uploader("Escolha um arquivo CSV", type=["csv"])
 
-  t_list, t_add, t_edit = st.tabs([
-      "📋 Usuários Cadastrados",
-      "➕ Cadastrar Novo Usuário",
-      "✏️ Editar / Excluir Usuário",
-  ])
+  if uploaded_file is not None:
+    try:
+      df_upload = pd.read_csv(uploaded_file)
+      st.write("Prévia dos dados:")
+      st.dataframe(df_upload.head(), use_container_width=True)
 
-  # Sub-aba 1: Listar Usuários
-  with t_list:
-    conn = sqlite3.connect(DB_FILE)
-    df_users = pd.read_sql_query("SELECT username, role FROM users", conn)
-    conn.close()
-    df_users.columns = ["Usuário (Login)", "Perfil de Acesso (Role)"]
-    st.dataframe(df_users, use_container_width=True)
-
-  # Sub-aba 2: Cadastrar Usuário
-  with t_add:
-    with st.form("form_novo_usuario", clear_on_submit=True):
-      new_user = st.text_input("Novo Usuário (Login)")
-      new_pass = st.text_input("Senha", type="password")
-      new_role = st.selectbox(
-          "Perfil de Permissão",
-          ["operator", "admin"],
-          help=(
-              "Admin: Acesso total e Gestão de Usuários. Operator: Acesso"
-              " completo às ferramentas de IPAM."
-          ),
-      )
-
-      if st.form_submit_button("Cadastrar Usuário"):
-        if new_user and new_pass:
-          conn = sqlite3.connect(DB_FILE)
-          cursor = conn.cursor()
+      if st.button("Confirmar Importação de CSV"):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        qtd = 0
+        for _, row in df_upload.iterrows():
           try:
             cursor.execute(
-                "INSERT INTO users VALUES (?, ?, ?)",
-                (new_user.strip(), make_hashes(new_pass), new_role),
+                "INSERT INTO blocos_ip VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(row["Prefixo"]).strip(),
+                    str(row["Versão"]).strip(),
+                    str(row["ASN Vinculado"]).strip(),
+                    str(row["Finalidade"]).strip(),
+                    str(row["VLAN ID"]).strip(),
+                    str(row["VRF"]).strip(),
+                    str(row["POP / Localidade"]).strip(),
+                    str(row["ID Circuito"]).strip(),
+                ),
             )
-            conn.commit()
-            registrar_log(
-                "CADASTRAR",
-                "Usuários",
-                f"Usuário {new_user.strip()} cadastrado como {new_role}",
-            )
-            st.success(
-                f"Usuário `{new_user.strip()}` registrado com sucesso!"
-            )
-            st.rerun()
-          except sqlite3.IntegrityError:
-            st.error("Este nome de usuário já existe no sistema.")
-          finally:
-            conn.close()
-        else:
-          st.error("Preencha o nome de usuário e a senha.")
+            qtd += 1
+          except Exception:
+            continue
+        conn.commit()
+        conn.close()
+        registrar_log(
+            "IMPORTAR", "Blocos_IP", f"Importados {qtd} blocos via CSV"
+        )
+        st.success(f"{qtd} blocos importados com sucesso!")
+        st.rerun()
+    except Exception as e:
+      st.error(f"Erro ao processar arquivo CSV: {e}")
 
-  # Sub-aba 3: Editar Perfil / Excluir Usuário
-  with t_edit:
-    conn = sqlite3.connect(DB_FILE)
-    df_u_edit = pd.read_sql_query("SELECT username, role FROM users", conn)
-    conn.close()
+# ==========================================
+# ABA 10: HISTÓRICO & AUDIT LOG
+# ==========================================
+elif aba == "📜 Histórico & Audit Log":
+  st.header("📜 Histórico de Alterações (Audit Log)")
+  df_logs = carregar_logs()
+  if df_logs.empty:
+    st.info("Nenhum registro de log até o momento.")
+  else:
+    st.dataframe(df_logs, use_container_width=True)
 
-    if df_u_edit.empty:
-      st.info("Nenhum usuário cadastrado.")
-    else:
-      lista_usuarios = df_u_edit["username"].tolist()
-      user_selecionado = st.selectbox(
-          "Selecione o Usuário para Gerenciar:", lista_usuarios
-      )
-      role_atual = df_u_edit[df_u_edit["username"] == user_selecionado][
-          "role"
-      ].values[0]
+# ==========================================
+# ABA 11: GESTÃO DO SISTEMA & BACKUP (ADMIN ONLY)
+# ==========================================
+elif aba == "🔐 Gestão do Sistema & Backup":
+  if st.session_state["user_role"] != "admin":
+    st.error("⚠️ Acesso Negado! Apenas administradores podem acessar esta área.")
+    st.stop()
 
-      with st.form("form_editar_usuario"):
-        st.subheader(f"Modificar Conta: `{user_selecionado}`")
+  st.header("🔐 Configurações do Sistema e Backup")
 
-        novo_perfil = st.selectbox(
-            "Perfil de Acesso",
-            ["operator", "admin"],
-            index=0 if role_atual == "operator" else 1,
-            help="Altere a função e as permissões deste usuário.",
+  tab_backup, tab_notif, tab_users = st.tabs([
+      "💾 Backup / Restauração DB",
+      "🔔 Configurar Notificações Webhook",
+      "👥 Controle de Usuários",
+  ])
+
+  with tab_backup:
+    st.subheader("Download do Banco de Dados SQLite")
+    if os.path.exists(DB_FILE):
+      with open(DB_FILE, "rb") as f:
+        st.download_button(
+            label="📥 Baixar Backup `ipam_database.db`",
+            data=f,
+            file_name=f"ipam_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+            mime="application/x-sqlite3",
         )
 
-        nova_senha = st.text_input(
-            "Nova Senha (deixe em branco caso não queira alterar a senha atual)",
-            type="password",
-        )
+  with tab_notif:
+    st.subheader("Integração com Webhook (Telegram / Slack / Discord / N8N)")
+    webhook_atual = obter_configuracao("webhook_url")
+    novo_webhook = st.text_input(
+        "URL do Webhook para alertas:", value=webhook_atual
+    )
+    if st.button("Salvar Webhook"):
+      salvar_configuracao("webhook_url", novo_webhook.strip())
+      st.success("URL de Webhook salva com sucesso!")
 
-        btn_salvar, btn_excluir = st.columns(2)
+  with tab_users:
+    t_list, t_add, t_edit = st.tabs(
+        ["📋 Usuários Cadastrados", "➕ Novo Usuário", "✏️ Editar Usuário"]
+    )
 
-        if btn_salvar.form_submit_button("💾 Salvar Alterações"):
-          conn = sqlite3.connect(DB_FILE)
-          cursor = conn.cursor()
+    with t_list:
+      conn = sqlite3.connect(DB_FILE)
+      df_users = pd.read_sql_query("SELECT username, role FROM users", conn)
+      conn.close()
+      df_users.columns = ["Usuário (Login)", "Perfil de Acesso (Role)"]
+      st.dataframe(df_users, use_container_width=True)
 
-          if nova_senha.strip():
-            # Atualiza perfil e senha
-            hash_nova_senha = make_hashes(nova_senha.strip())
-            cursor.execute(
-                "UPDATE users SET role=?, password=? WHERE username=?",
-                (novo_perfil, hash_nova_senha, user_selecionado),
-            )
-            detalhe_log = (
-                f"Perfil do usuário {user_selecionado} alterado para"
-                f" {novo_perfil} e senha redefinida"
-            )
-          else:
-            # Atualiza apenas perfil
-            cursor.execute(
-                "UPDATE users SET role=? WHERE username=?",
-                (novo_perfil, user_selecionado),
-            )
-            detalhe_log = (
-                f"Perfil do usuário {user_selecionado} alterado para"
-                f" {novo_perfil}"
-            )
+    with t_add:
+      with st.form("form_novo_usuario", clear_on_submit=True):
+        new_user = st.text_input("Novo Usuário (Login)")
+        new_pass = st.text_input("Senha", type="password")
+        new_role = st.selectbox("Perfil", ["operator", "admin"])
 
-          conn.commit()
-          conn.close()
-          registrar_log("EDITAR", "Usuários", detalhe_log)
-          st.success(f"Usuário `{user_selecionado}` atualizado com sucesso!")
-          st.rerun()
-
-        if btn_excluir.form_submit_button("🗑️ Excluir Usuário"):
-          if user_selecionado == st.session_state["username"]:
-            st.error(
-                "⚠️ Operação não permitida! Você não pode excluir a sua própria"
-                " conta enquanto estiver logado."
-            )
-          else:
+        if st.form_submit_button("Cadastrar Usuário"):
+          if new_user and new_pass:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM users WHERE username=?", (user_selecionado,)
-            )
+            try:
+              cursor.execute(
+                  "INSERT INTO users VALUES (?, ?, ?)",
+                  (new_user.strip(), make_hashes(new_pass), new_role),
+              )
+              conn.commit()
+              registrar_log(
+                  "CADASTRAR",
+                  "Usuários",
+                  f"Usuário {new_user.strip()} cadastrado como {new_role}",
+              )
+              st.success(
+                  f"Usuário `{new_user.strip()}` registrado com sucesso!"
+              )
+              st.rerun()
+            except sqlite3.IntegrityError:
+              st.error("Este nome de usuário já existe no sistema.")
+            finally:
+              conn.close()
+
+    with t_edit:
+      conn = sqlite3.connect(DB_FILE)
+      df_u_edit = pd.read_sql_query("SELECT username, role FROM users", conn)
+      conn.close()
+
+      if not df_u_edit.empty:
+        lista_usuarios = df_u_edit["username"].tolist()
+        user_selecionado = st.selectbox("Selecione o Usuário:", lista_usuarios)
+        role_atual = df_u_edit[df_u_edit["username"] == user_selecionado][
+            "role"
+        ].values[0]
+
+        with st.form("form_editar_usuario"):
+          novo_perfil = st.selectbox(
+              "Perfil de Acesso",
+              ["operator", "admin"],
+              index=0 if role_atual == "operator" else 1,
+          )
+          nova_senha = st.text_input(
+              "Nova Senha (deixe em branco se não quiser alterar)",
+              type="password",
+          )
+
+          btn_salvar, btn_excluir = st.columns(2)
+
+          if btn_salvar.form_submit_button("💾 Salvar Alterações"):
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            if nova_senha.strip():
+              cursor.execute(
+                  "UPDATE users SET role=?, password=? WHERE username=?",
+                  (novo_perfil, make_hashes(nova_senha.strip()), user_selecionado),
+              )
+            else:
+              cursor.execute(
+                  "UPDATE users SET role=? WHERE username=?",
+                  (novo_perfil, user_selecionado),
+              )
             conn.commit()
             conn.close()
             registrar_log(
-                "EXCLUIR",
+                "EDITAR",
                 "Usuários",
-                f"Usuário {user_selecionado} excluído do sistema",
+                f"Perfil do usuário {user_selecionado} atualizado",
             )
-            st.warning(f"Usuário `{user_selecionado}` removido com sucesso!")
+            st.success("Usuário atualizado com sucesso!")
             st.rerun()
+
+          if btn_excluir.form_submit_button("🗑️ Excluir Usuário"):
+            if user_selecionado == st.session_state["username"]:
+              st.error("Você não pode excluir sua própria conta logada.")
+            else:
+              conn = sqlite3.connect(DB_FILE)
+              cursor = conn.cursor()
+              cursor.execute(
+                  "DELETE FROM users WHERE username=?", (user_selecionado,)
+              )
+              conn.commit()
+              conn.close()
+              registrar_log(
+                  "EXCLUIR", "Usuários", f"Usuário {user_selecionado} excluído"
+              )
+              st.warning("Usuário removido!")
+              st.rerun()
